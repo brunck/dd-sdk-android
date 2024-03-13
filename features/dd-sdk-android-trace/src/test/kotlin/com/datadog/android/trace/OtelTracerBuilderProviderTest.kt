@@ -19,8 +19,10 @@ import com.datadog.opentelemetry.trace.OtelSpanContext
 import com.datadog.tools.unit.getFieldValue
 import com.datadog.trace.api.Config
 import com.datadog.trace.api.config.TracerConfig
+import com.datadog.trace.api.sampling.PrioritySampling
 import com.datadog.trace.common.writer.Writer
 import com.datadog.trace.core.CoreTracer
+import com.datadog.trace.core.DDSpan
 import com.datadog.trace.core.DDSpanContext
 import fr.xgouchet.elmyr.Forge
 import fr.xgouchet.elmyr.annotation.DoubleForgery
@@ -71,6 +73,9 @@ internal class OtelTracerBuilderProviderTest {
 
     @StringForgery
     lateinit var fakeInstrumentationName: String
+
+    @StringForgery
+    lateinit var fakeOperationName: String
 
     @Mock
     lateinit var mockTraceWriter: Writer
@@ -344,36 +349,6 @@ internal class OtelTracerBuilderProviderTest {
     }
 
     @Test
-    fun `M use the default sample rate W creating a tracer`() {
-        // Given
-        val expectedNormalizedSampleRate = OtelTracerProvider.DEFAULT_SAMPLE_RATE / 100.0
-        val tracer = testedOtelTracerProviderBuilder.build()
-            .tracerBuilder(fakeInstrumentationName).build()
-
-        // When
-        val coreTracer: CoreTracer = tracer.getFieldValue("tracer")
-
-        // Then
-        val config: Config = coreTracer.getFieldValue("initialConfig")
-        assertThat(config.traceSampleRate).isCloseTo(expectedNormalizedSampleRate, offset(0.005))
-    }
-
-    @Test
-    fun `M use the sample rate W setSampleRate`(@DoubleForgery(min = 0.0, max = 100.0) sampleRate: Double) {
-        // Given
-        val expectedNormalizedSampleRate = sampleRate / 100.0
-        val tracer = testedOtelTracerProviderBuilder.setSampleRate(sampleRate).build()
-            .tracerBuilder(fakeInstrumentationName).build()
-
-        // When
-        val coreTracer: CoreTracer = tracer.getFieldValue("tracer")
-
-        // Then
-        val config: Config = coreTracer.getFieldValue("initialConfig")
-        assertThat(config.traceSampleRate).isCloseTo(expectedNormalizedSampleRate, offset(0.005))
-    }
-
-    @Test
     fun `M set correct propagating style W setting tracing header types`(forge: Forge) {
         // Given
         val tracingHeaderStyles = forge.aList { aValueFrom(TracingHeaderType::class.java) }.toSet()
@@ -443,6 +418,133 @@ internal class OtelTracerBuilderProviderTest {
         val span = tracer.spanBuilder(operation).startSpan() as OtelSpan
         val agentSpanContext = span.agentSpanContext as DDSpanContext
         assertThat(agentSpanContext.tags).containsEntry(key, value)
+    }
+
+    // endregion
+
+    // region Sampling priority
+
+    @Test
+    fun `M not add a sample rate by default W creating a tracer`() {
+        // Given
+        val tracer = testedOtelTracerProviderBuilder.build()
+            .tracerBuilder(fakeInstrumentationName).build()
+
+        // When
+        val coreTracer: CoreTracer = tracer.getFieldValue("tracer")
+
+        // Then
+        val config: Config = coreTracer.getFieldValue("initialConfig")
+        val traceSampleRate: Double? = config.traceSampleRate
+        assertThat(traceSampleRate).isNull()
+    }
+
+    @Test
+    fun `M use the sample rate W setSampleRate`(@DoubleForgery(min = 0.0, max = 100.0) sampleRate: Double) {
+        // Given
+        val expectedNormalizedSampleRate = sampleRate / 100.0
+        val tracer = testedOtelTracerProviderBuilder.setSampleRate(sampleRate).build()
+            .tracerBuilder(fakeInstrumentationName).build()
+
+        // When
+        val coreTracer: CoreTracer = tracer.getFieldValue("tracer")
+
+        // Then
+        val config: Config = coreTracer.getFieldValue("initialConfig")
+        assertThat(config.traceSampleRate).isCloseTo(expectedNormalizedSampleRate, offset(0.005))
+    }
+
+    @Test
+    fun `M use user-keep priority W buildSpan { provided keep sample rate }`() {
+        // Given
+        val tracer = testedOtelTracerProviderBuilder
+            .setPartialFlushThreshold(1)
+            .setSampleRate(100.0)
+            .build()
+            .tracerBuilder(fakeInstrumentationName)
+            .build()
+
+        // When
+        val span = tracer
+            .spanBuilder(fakeOperationName)
+            .startSpan()
+        val delegateSpan: DDSpan = span.getFieldValue("delegate")
+        delegateSpan.forceSamplingDecision()
+        span.end()
+
+        // Then
+        val priority = delegateSpan.samplingPriority
+        assertThat(priority).isEqualTo(PrioritySampling.USER_KEEP.toInt())
+    }
+
+    @Test
+    fun `M use user-drop priority W buildSpan { provide not keep sample rate }`() {
+        // Given
+        val tracer = testedOtelTracerProviderBuilder
+            .setPartialFlushThreshold(1)
+            .setSampleRate(0.0)
+            .build()
+            .tracerBuilder(fakeInstrumentationName)
+            .build()
+
+        // When
+        val span = tracer
+            .spanBuilder(fakeOperationName)
+            .startSpan()
+        val delegateSpan: DDSpan = span.getFieldValue("delegate")
+        delegateSpan.forceSamplingDecision()
+        span.end()
+
+        // Then
+        val priority = delegateSpan.samplingPriority
+        assertThat(priority).isEqualTo(PrioritySampling.USER_DROP.toInt())
+    }
+
+    @Test
+    fun `M use user-keep or user-not-keep priority W buildSpan { provided random sample rate }`(
+        @DoubleForgery(min = 0.0, max = 100.0) sampleRate: Double
+    ) {
+        // Given
+        val tracer = testedOtelTracerProviderBuilder
+            .setPartialFlushThreshold(1)
+            .setSampleRate(sampleRate)
+            .build()
+            .tracerBuilder(fakeInstrumentationName)
+            .build()
+
+        // When
+        val span = tracer
+            .spanBuilder(fakeOperationName)
+            .startSpan()
+        val delegateSpan: DDSpan = span.getFieldValue("delegate")
+        delegateSpan.forceSamplingDecision()
+        span.end()
+
+        // Then
+        val priority = delegateSpan.samplingPriority
+        assertThat(priority).isIn(PrioritySampling.USER_DROP.toInt(), PrioritySampling.USER_KEEP.toInt())
+    }
+
+    @Test
+    fun `M use auto - keep priority W buildSpan { not provided sample rate }`() {
+        // Given
+        val tracer = testedOtelTracerProviderBuilder
+            .setPartialFlushThreshold(1)
+            .build()
+            .tracerBuilder(fakeInstrumentationName)
+            .build()
+
+        // When
+        val span = tracer
+            .spanBuilder(fakeOperationName)
+            .startSpan()
+        val delegateSpan: DDSpan = span.getFieldValue("delegate")
+        delegateSpan.forceSamplingDecision()
+        span.end()
+
+        // Then
+        val priority = delegateSpan.samplingPriority
+        assertThat(priority).isEqualTo(PrioritySampling.SAMPLER_KEEP.toInt())
     }
 
     // endregion
